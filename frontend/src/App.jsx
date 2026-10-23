@@ -1,6 +1,21 @@
-import { useEffect, useMemo, useState } from 'react';
 
-const API = 'http://localhost:8082/api/packages';
+import { useEffect, useMemo, useState } from 'react';
+import { db, auth } from './firebase';
+
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut
+} from 'firebase/auth';
+
+import {
+  addDoc,
+  collection,
+  getDocs,
+  updateDoc,
+  doc,
+  serverTimestamp
+} from 'firebase/firestore';
 
 const emptyForm = {
   senderName: '',
@@ -10,114 +25,152 @@ const emptyForm = {
   dimensions: ''
 };
 
-// Handles normal date strings and older Firestore date objects.
 function formatCreatedAt(value) {
-  if (!value) return '—';
+  if (!value) return 'Date not recorded';
 
   let date;
 
-  if (typeof value === 'string' || typeof value === 'number') {
+  // Firestore Timestamp
+  if (typeof value.toDate === 'function') {
+    date = value.toDate();
+  }
+  // Java LocalDateTime stored as an object
+  else if (
+    typeof value.year === 'number' &&
+    typeof value.monthValue === 'number' &&
+    typeof value.dayOfMonth === 'number'
+  ) {
+    date = new Date(
+      value.year,
+      value.monthValue - 1,
+      value.dayOfMonth,
+      value.hour || 0,
+      value.minute || 0,
+      value.second || 0,
+      Math.floor((value.nano || 0) / 1000000)
+    );
+  }
+  // Timestamp-like object
+  else if (typeof value.seconds === 'number') {
+    date = new Date(value.seconds * 1000);
+  }
+  // ISO date string or number
+  else if (
+    typeof value === 'string' ||
+    typeof value === 'number'
+  ) {
     date = new Date(value);
-  } else if (typeof value === 'object') {
-    // Handle Firestore timestamp objects.
-    if (typeof value.seconds === 'number') {
-      date = new Date(value.seconds * 1000);
-    } else {
-      const months = {
-        JANUARY: 0,
-        FEBRUARY: 1,
-        MARCH: 2,
-        APRIL: 3,
-        MAY: 4,
-        JUNE: 5,
-        JULY: 6,
-        AUGUST: 7,
-        SEPTEMBER: 8,
-        OCTOBER: 9,
-        NOVEMBER: 10,
-        DECEMBER: 11
-      };
-
-      const year = Number(value.year);
-      const day = Number(value.dayOfMonth);
-      const month = value.monthValue != null
-        ? Number(value.monthValue) - 1
-        : months[String(value.month).toUpperCase()];
-
-      if (
-        Number.isFinite(year) &&
-        Number.isFinite(day) &&
-        Number.isFinite(month) &&
-        month >= 0 &&
-        month <= 11
-      ) {
-        date = new Date(
-          year,
-          month,
-          day,
-          Number(value.hour || 0),
-          Number(value.minute || 0),
-          Number(value.second || 0)
-        );
-      }
-    }
+  } else {
+    return 'Date not recorded';
   }
 
-  if (!date || Number.isNaN(date.getTime())) {
-    return 'Date unavailable';
+  if (Number.isNaN(date.getTime())) {
+    return 'Date not recorded';
   }
 
-  return date.toLocaleString();
+  return date.toLocaleString('en-IN');
 }
 
 export default function App() {
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [packages, setPackages] = useState([]);
   const [form, setForm] = useState(emptyForm);
   const [search, setSearch] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, currentUser => {
+      setUser(currentUser);
+      setAuthLoading(false);
+    });
+
+    return unsubscribe;
+  }, []);
+
+  async function login(event) {
+    event.preventDefault();
+    setBusy(true);
+    setMessage('');
+
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      setPassword('');
+      setMessage('Login successful.');
+    } catch (error) {
+      setMessage(`Login failed: ${error.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logout() {
+    try {
+      await signOut(auth);
+      setPackages([]);
+      setMessage('Logged out successfully.');
+    } catch (error) {
+      setMessage(`Logout failed: ${error.message}`);
+    }
+  }
+
   async function loadPackages() {
     try {
-      const response = await fetch(API);
+      const snapshot = await getDocs(collection(db, 'packages'));
 
-      if (!response.ok) {
-        throw new Error('Could not load packages');
-      }
+      const data = snapshot.docs.map(packageDoc => ({
+        ...packageDoc.data(),
+        id: packageDoc.id
+      }));
 
-      const data = await response.json();
-      setPackages(Array.isArray(data) ? data : []);
-    } catch {
-      setMessage(
-        'Backend connect avvaledu. Spring Boot backend and Firebase connection check cheyyi.'
-      );
+      data.sort((a, b) => {
+        const first = a.createdAt?.seconds
+          ?? a.createdAt?.year
+          ?? 0;
+        const second = b.createdAt?.seconds
+          ?? b.createdAt?.year
+          ?? 0;
+
+        return second - first;
+      });
+
+      setPackages(data);
+    } catch (error) {
+      setMessage(`Could not load packages: ${error.message}`);
     }
   }
 
   useEffect(() => {
-    loadPackages();
-  }, []);
+    if (user) {
+      loadPackages();
+    } else {
+      setPackages([]);
+    }
+  }, [user]);
 
   const summary = useMemo(() => ({
     total: packages.length,
     registered: packages.filter(
-      p => p.status === 'REGISTERED'
+      item => item.status === 'REGISTERED'
     ).length,
     stored: packages.filter(
-      p => p.status === 'STORED'
+      item => item.status === 'STORED'
     ).length,
     dispatched: packages.filter(
-      p => p.status === 'DISPATCHED'
+      item => item.status === 'DISPATCHED'
     ).length
   }), [packages]);
 
-  const visiblePackages = packages.filter(p =>
+  const visiblePackages = packages.filter(item =>
     [
-      p.trackingId,
-      p.senderName,
-      p.receiverName,
-      p.destination,
-      p.status
+      item.trackingId,
+      item.senderName,
+      item.receiverName,
+      item.destination,
+      item.status
     ].some(value =>
       String(value ?? '')
         .toLowerCase()
@@ -126,79 +179,137 @@ export default function App() {
   );
 
   function updateForm(event) {
-    setForm({
-      ...form,
+    setForm(previous => ({
+      ...previous,
       [event.target.name]: event.target.value
-    });
+    }));
   }
 
   async function registerPackage(event) {
     event.preventDefault();
+
+    if (!user) {
+      setMessage('Please login first.');
+      return;
+    }
+
     setBusy(true);
     setMessage('');
 
     try {
-      const response = await fetch(API, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          ...form,
-          weightKg: Number(form.weightKg)
-        })
+      const trackingId =
+        `PKG-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+
+      await addDoc(collection(db, 'packages'), {
+        trackingId,
+        senderName: form.senderName.trim(),
+        receiverName: form.receiverName.trim(),
+        destination: form.destination.trim(),
+        weightKg: Number(form.weightKg),
+        dimensions: form.dimensions.trim(),
+        status: 'REGISTERED',
+        createdAt: serverTimestamp(),
+        registeredBy: user.uid
       });
 
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(
-          body || 'Registration failed. Check all fields.'
-        );
-      }
-
-      const created = await response.json();
-
       setForm(emptyForm);
-      setMessage(
-        `Package registered. Tracking ID: ${created.trackingId}`
-      );
+      setMessage(`Package registered. Tracking ID: ${trackingId}`);
 
       await loadPackages();
     } catch (error) {
-      setMessage(
-        error.message || 'Package registration failed.'
-      );
+      setMessage(`Registration failed: ${error.message}`);
     } finally {
       setBusy(false);
     }
   }
 
   async function updateStatus(item, action) {
+    if (!user) {
+      setMessage('Please login first.');
+      return;
+    }
+
+    const newStatus =
+      action === 'dispatch' ? 'DISPATCHED' : 'STORED';
+
     setMessage('');
 
     try {
-      const response = await fetch(
-        `${API}/${item.id}/${action}`,
-        { method: 'PATCH' }
-      );
+      const updates = {
+        status: newStatus,
+        updatedAt: serverTimestamp()
+      };
 
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(body || 'Status update failed');
+      if (action === 'dispatch') {
+        updates.dispatchedAt = serverTimestamp();
       }
 
+      await updateDoc(doc(db, 'packages', item.id), updates);
+
       setMessage(
-        action === 'dispatch'
-          ? `${item.trackingId} dispatched.`
-          : `${item.trackingId} marked as stored.`
+        `${item.trackingId} status updated to ${newStatus}.`
       );
 
       await loadPackages();
     } catch (error) {
-      setMessage(
-        error.message || 'Status update failed.'
-      );
+      setMessage(`Status update failed: ${error.message}`);
     }
+  }
+
+  if (authLoading) {
+    return (
+      <main className="container">
+        <p>Checking login...</p>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main className="container">
+        <section className="panel">
+          <h1>Warehouse Login</h1>
+
+          <p className="muted">
+            Login using your Firebase Email/Password account.
+          </p>
+
+          {message && (
+            <div className="message" role="status">
+              {message}
+            </div>
+          )}
+
+          <form onSubmit={login} className="form-grid">
+            <label>
+              Email
+              <input
+                type="email"
+                value={email}
+                onChange={event => setEmail(event.target.value)}
+                required
+              />
+            </label>
+
+            <label>
+              Password
+              <input
+                type="password"
+                value={password}
+                onChange={event => setPassword(event.target.value)}
+                required
+              />
+            </label>
+
+            <div className="form-action">
+              <button type="submit" disabled={busy}>
+                {busy ? 'Logging in...' : 'Login'}
+              </button>
+            </div>
+          </form>
+        </section>
+      </main>
+    );
   }
 
   return (
@@ -210,15 +321,17 @@ export default function App() {
           <p className="muted">
             Register, store, search and dispatch parcels.
           </p>
+          <p className="muted">Logged in: {user.email}</p>
         </div>
 
-        <span className="role">Member 3</span>
+        <div>
+          <span className="role">Member 3</span>{' '}
+          <button type="button" onClick={logout}>Logout</button>
+        </div>
       </header>
 
       {message && (
-        <div className="message" role="status">
-          {message}
-        </div>
+        <div className="message" role="status">{message}</div>
       )}
 
       <section className="stats">
@@ -328,31 +441,31 @@ export default function App() {
               {visiblePackages.map(item => (
                 <tr key={item.id}>
                   <td>
-                    <strong>{item.trackingId}</strong>
+                    <strong>{item.trackingId || item.id}</strong>
                     <small>
                       Created: {formatCreatedAt(item.createdAt)}
                     </small>
                   </td>
 
                   <td>
-                    {item.senderName}
-                    <small>To: {item.receiverName}</small>
+                    {item.senderName || '—'}
+                    <small>To: {item.receiverName || '—'}</small>
                   </td>
 
-                  <td>{item.destination}</td>
+                  <td>{item.destination || '—'}</td>
 
                   <td>
-                    {item.weightKg} kg
-                    <small>{item.dimensions}</small>
+                    {item.weightKg ?? '—'} kg
+                    <small>{item.dimensions || '—'}</small>
                   </td>
 
                   <td>
                     <span
-                      className={`status ${
-                        String(item.status || '').toLowerCase()
-                      }`}
+                      className={`status ${String(
+                        item.status || ''
+                      ).toLowerCase()}`}
                     >
-                      {item.status}
+                      {item.status || 'UNKNOWN'}
                     </span>
                   </td>
 
@@ -392,7 +505,7 @@ export default function App() {
       </section>
 
       <footer>
-        Warehouse &amp; Package Management · React + Spring Boot + Firebase Firestore
+        Warehouse &amp; Package Management · React + Firebase Firestore
       </footer>
     </main>
   );
